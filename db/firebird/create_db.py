@@ -9,8 +9,8 @@ import time
 import sys
 from datetime import datetime, timedelta
 import random
-import fdb
 import os
+import tempfile
 
 # Docker configuration
 CONTAINER_NAME = "firebird-server"
@@ -42,17 +42,12 @@ def wait_for_firebird():
     max_attempts = 30
     for attempt in range(max_attempts):
         try:
-            # Try to connect to the database
-            con = fdb.connect(
-                host=FIREBIRD_HOST,
-                port=FIREBIRD_PORT,
-                database=DB_FILE_PATH,
-                user=FIREBIRD_USER,
-                password=FIREBIRD_PASSWORD
-            )
-            con.close()
-            print("Firebird is ready!")
-            return True
+            # Try to connect using isql through docker exec
+            test_command = f"""docker exec {CONTAINER_NAME} /opt/firebird/bin/isql -user {FIREBIRD_USER} -password {FIREBIRD_PASSWORD} {DB_FILE_PATH} -q -o /dev/null <<< "SELECT 1 FROM RDB\\$DATABASE;" """
+            result = run_command(test_command, check=False)
+            if result is not None:
+                print("Firebird is ready!")
+                return True
         except Exception:
             pass
         
@@ -62,19 +57,33 @@ def wait_for_firebird():
     print("Firebird failed to start within the expected time")
     return False
 
-def get_firebird_connection():
-    """Get Firebird database connection."""
+def execute_firebird_sql(sql_commands, database_path=None):
+    """Execute SQL commands on Firebird using isql."""
+    if database_path is None:
+        database_path = DB_FILE_PATH
+    
     try:
-        con = fdb.connect(
-            host=FIREBIRD_HOST,
-            port=FIREBIRD_PORT,
-            database=DB_FILE_PATH,
-            user=FIREBIRD_USER,
-            password=FIREBIRD_PASSWORD
-        )
-        return con
+        # Create a temporary SQL file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sql', delete=False) as f:
+            f.write(sql_commands)
+            temp_sql_file = f.name
+        
+        # Copy the SQL file to the container
+        copy_command = f"docker cp {temp_sql_file} {CONTAINER_NAME}:/tmp/temp_script.sql"
+        run_command(copy_command)
+        
+        # Execute the SQL file using isql
+        isql_command = f"""docker exec {CONTAINER_NAME} /opt/firebird/bin/isql -user {FIREBIRD_USER} -password {FIREBIRD_PASSWORD} {database_path} -i /tmp/temp_script.sql"""
+        result = run_command(isql_command, check=False)
+        
+        # Clean up
+        os.unlink(temp_sql_file)
+        run_command(f"docker exec {CONTAINER_NAME} rm -f /tmp/temp_script.sql", check=False)
+        
+        return result
+        
     except Exception as e:
-        print(f"Failed to connect to Firebird: {e}")
+        print(f"Failed to execute SQL: {e}")
         return None
 
 def create_database():
@@ -82,17 +91,16 @@ def create_database():
     print("Creating Firebird database...")
     
     try:
-        # Create database
-        con = fdb.create_database(
-            host=FIREBIRD_HOST,
-            port=FIREBIRD_PORT,
-            database=DB_FILE_PATH,
-            user=FIREBIRD_USER,
-            password=FIREBIRD_PASSWORD
-        )
-        con.close()
-        print("Database created successfully!")
-        return True
+        # Create database using isql
+        create_db_command = f"""docker exec {CONTAINER_NAME} /opt/firebird/bin/isql -user {FIREBIRD_USER} -password {FIREBIRD_PASSWORD} -q <<< "CREATE DATABASE '{DB_FILE_PATH}';" """
+        result = run_command(create_db_command, check=False)
+        
+        if result is not None:
+            print("Database created successfully!")
+            return True
+        else:
+            print("Failed to create database")
+            return False
     except Exception as e:
         print(f"Failed to create database: {e}")
         return False
@@ -101,110 +109,88 @@ def create_tables():
     """Create sample tables in Firebird."""
     print("Creating Firebird tables...")
     
-    con = get_firebird_connection()
-    if not con:
-        return False
+    sql_script = """
+    -- Create employees table
+    CREATE TABLE employees (
+        id INTEGER NOT NULL PRIMARY KEY,
+        first_name VARCHAR(50) NOT NULL,
+        last_name VARCHAR(50) NOT NULL,
+        email VARCHAR(100) UNIQUE NOT NULL,
+        department VARCHAR(50),
+        position VARCHAR(100),
+        salary DECIMAL(10,2),
+        hire_date DATE,
+        is_active CHAR(1) DEFAULT 'Y',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Create products table
+    CREATE TABLE products (
+        id INTEGER NOT NULL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        description BLOB SUB_TYPE TEXT,
+        category VARCHAR(50),
+        price DECIMAL(10,2),
+        stock_quantity INTEGER DEFAULT 0,
+        manufacturer VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Create customers table
+    CREATE TABLE customers (
+        id INTEGER NOT NULL PRIMARY KEY,
+        first_name VARCHAR(50) NOT NULL,
+        last_name VARCHAR(50) NOT NULL,
+        email VARCHAR(100) UNIQUE NOT NULL,
+        phone VARCHAR(20),
+        address BLOB SUB_TYPE TEXT,
+        city VARCHAR(50),
+        country VARCHAR(50),
+        registration_date DATE DEFAULT CURRENT_DATE,
+        is_active CHAR(1) DEFAULT 'Y'
+    );
+
+    -- Create orders table
+    CREATE TABLE orders (
+        id INTEGER NOT NULL PRIMARY KEY,
+        customer_name VARCHAR(100) NOT NULL,
+        customer_email VARCHAR(100),
+        order_date DATE NOT NULL,
+        total_amount DECIMAL(12,2),
+        status VARCHAR(20) DEFAULT 'PENDING',
+        shipping_address BLOB SUB_TYPE TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Create order_items table
+    CREATE TABLE order_items (
+        id INTEGER NOT NULL PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price DECIMAL(10,2) NOT NULL,
+        total_price DECIMAL(12,2) NOT NULL,
+        FOREIGN KEY (order_id) REFERENCES orders(id),
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    );
+
+    -- Create indexes
+    CREATE INDEX idx_employees_department ON employees(department);
+    CREATE INDEX idx_products_category ON products(category);
+    CREATE INDEX idx_orders_status ON orders(status);
+    CREATE INDEX idx_orders_date ON orders(order_date);
+    CREATE INDEX idx_customers_email ON customers(email);
+
+    COMMIT;
+    """
     
-    try:
-        cur = con.cursor()
-        
-        # Create employees table
-        print("Creating 'employees' table...")
-        cur.execute("""
-            CREATE TABLE employees (
-                id INTEGER NOT NULL PRIMARY KEY,
-                first_name VARCHAR(50) NOT NULL,
-                last_name VARCHAR(50) NOT NULL,
-                email VARCHAR(100) UNIQUE NOT NULL,
-                department VARCHAR(50),
-                position VARCHAR(100),
-                salary DECIMAL(10,2),
-                hire_date DATE,
-                is_active CHAR(1) DEFAULT 'Y',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create products table
-        print("Creating 'products' table...")
-        cur.execute("""
-            CREATE TABLE products (
-                id INTEGER NOT NULL PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                description BLOB SUB_TYPE TEXT,
-                category VARCHAR(50),
-                price DECIMAL(10,2),
-                stock_quantity INTEGER DEFAULT 0,
-                manufacturer VARCHAR(100),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create orders table
-        print("Creating 'orders' table...")
-        cur.execute("""
-            CREATE TABLE orders (
-                id INTEGER NOT NULL PRIMARY KEY,
-                customer_name VARCHAR(100) NOT NULL,
-                customer_email VARCHAR(100),
-                order_date DATE NOT NULL,
-                total_amount DECIMAL(12,2),
-                status VARCHAR(20) DEFAULT 'PENDING',
-                shipping_address BLOB SUB_TYPE TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create order_items table
-        print("Creating 'order_items' table...")
-        cur.execute("""
-            CREATE TABLE order_items (
-                id INTEGER NOT NULL PRIMARY KEY,
-                order_id INTEGER NOT NULL,
-                product_id INTEGER NOT NULL,
-                quantity INTEGER NOT NULL,
-                unit_price DECIMAL(10,2) NOT NULL,
-                total_price DECIMAL(12,2) NOT NULL,
-                FOREIGN KEY (order_id) REFERENCES orders(id),
-                FOREIGN KEY (product_id) REFERENCES products(id)
-            )
-        """)
-        
-        # Create customers table
-        print("Creating 'customers' table...")
-        cur.execute("""
-            CREATE TABLE customers (
-                id INTEGER NOT NULL PRIMARY KEY,
-                first_name VARCHAR(50) NOT NULL,
-                last_name VARCHAR(50) NOT NULL,
-                email VARCHAR(100) UNIQUE NOT NULL,
-                phone VARCHAR(20),
-                address BLOB SUB_TYPE TEXT,
-                city VARCHAR(50),
-                country VARCHAR(50),
-                registration_date DATE DEFAULT CURRENT_DATE,
-                is_active CHAR(1) DEFAULT 'Y'
-            )
-        """)
-        
-        # Create indexes
-        print("Creating indexes...")
-        cur.execute("CREATE INDEX idx_employees_department ON employees(department)")
-        cur.execute("CREATE INDEX idx_products_category ON products(category)")
-        cur.execute("CREATE INDEX idx_orders_status ON orders(status)")
-        cur.execute("CREATE INDEX idx_orders_date ON orders(order_date)")
-        cur.execute("CREATE INDEX idx_customers_email ON customers(email)")
-        
-        con.commit()
-        con.close()
+    result = execute_firebird_sql(sql_script)
+    if result is not None:
         print("Tables and indexes created successfully!")
         return True
-        
-    except Exception as e:
-        print(f"Failed to create tables: {e}")
-        con.rollback()
-        con.close()
+    else:
+        print("Failed to create tables")
         return False
 
 def generate_sample_data():
@@ -225,7 +211,7 @@ def generate_sample_data():
             'department': random.choice(departments),
             'position': random.choice(positions),
             'salary': round(random.uniform(40000, 120000), 2),
-            'hire_date': (datetime.now() - timedelta(days=random.randint(30, 1825))).date(),
+            'hire_date': (datetime.now() - timedelta(days=random.randint(30, 1825))).strftime('%Y-%m-%d'),
             'is_active': random.choice(['Y', 'N'])
         })
     
@@ -260,7 +246,7 @@ def generate_sample_data():
             'address': f"{random.randint(100, 9999)} Main Street",
             'city': random.choice(cities),
             'country': random.choice(countries),
-            'registration_date': (datetime.now() - timedelta(days=random.randint(1, 730))).date(),
+            'registration_date': (datetime.now() - timedelta(days=random.randint(1, 730))).strftime('%Y-%m-%d'),
             'is_active': random.choice(['Y', 'N'])
         })
     
@@ -273,7 +259,7 @@ def generate_sample_data():
             'id': i,
             'customer_name': f"Customer {random.randint(1, 150)}",
             'customer_email': f"customer{random.randint(1, 150)}@email.com",
-            'order_date': (datetime.now() - timedelta(days=random.randint(1, 365))).date(),
+            'order_date': (datetime.now() - timedelta(days=random.randint(1, 365))).strftime('%Y-%m-%d'),
             'total_amount': round(random.uniform(25.0, 2500.0), 2),
             'status': random.choice(statuses),
             'shipping_address': f"{random.randint(100, 9999)} Shipping Street, {random.choice(cities)}"
@@ -300,42 +286,55 @@ def generate_sample_data():
     
     return employees_data, products_data, customers_data, orders_data, order_items_data
 
+def escape_sql_string(value):
+    """Escape single quotes in SQL strings."""
+    if isinstance(value, str):
+        return value.replace("'", "''")
+    return str(value)
+
 def insert_data(table_name, data, columns):
     """Insert data into a Firebird table."""
+    if not data:
+        return True
+    
     print(f"Inserting data into '{table_name}' table...")
     
-    con = get_firebird_connection()
-    if not con:
-        return False
+    # Generate INSERT statements in batches
+    batch_size = 50
+    total_items = len(data)
     
-    try:
-        cur = con.cursor()
+    for i in range(0, total_items, batch_size):
+        batch = data[i:i + batch_size]
         
-        # Prepare the INSERT statement
-        placeholders = ', '.join(['?' for _ in columns])
-        sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
-        
-        # Insert data in batches
-        batch_size = 50
-        total_items = len(data)
-        
-        for i in range(0, total_items, batch_size):
-            batch = data[i:i + batch_size]
-            batch_values = [[item[col] for col in columns] for item in batch]
+        # Build INSERT statements for this batch
+        sql_statements = []
+        for item in batch:
+            values = []
+            for col in columns:
+                value = item[col]
+                if value is None:
+                    values.append('NULL')
+                elif isinstance(value, str):
+                    values.append(f"'{escape_sql_string(value)}'")
+                else:
+                    values.append(str(value))
             
-            cur.executemany(sql, batch_values)
-            print(f"Inserted batch {i//batch_size + 1}/{(total_items + batch_size - 1)//batch_size}")
+            sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({', '.join(values)});"
+            sql_statements.append(sql)
         
-        con.commit()
-        con.close()
-        print(f"Successfully inserted {total_items} records into '{table_name}' table")
-        return True
+        # Add COMMIT at the end of each batch
+        sql_statements.append("COMMIT;")
+        batch_sql = '\n'.join(sql_statements)
         
-    except Exception as e:
-        print(f"Failed to insert data into '{table_name}' table: {e}")
-        con.rollback()
-        con.close()
-        return False
+        result = execute_firebird_sql(batch_sql)
+        if result is None:
+            print(f"Failed to insert batch {i//batch_size + 1} into '{table_name}' table")
+            return False
+        
+        print(f"Inserted batch {i//batch_size + 1}/{(total_items + batch_size - 1)//batch_size}")
+    
+    print(f"Successfully inserted {total_items} records into '{table_name}' table")
+    return True
 
 def main():
     """Main function to set up Firebird and populate with sample data."""
@@ -370,7 +369,7 @@ def main():
         return False
     
     # Wait for Firebird to be ready
-    time.sleep(10)  # Give Firebird some time to initialize
+    time.sleep(15)  # Give Firebird some time to initialize
     
     # Create database
     if not create_database():
@@ -429,13 +428,12 @@ def main():
     print("- orders: Order records")
     print("- order_items: Order line items")
     print("\nYou can now connect to Firebird and start querying!")
-    print("Example usage:")
-    print("  import fdb")
-    print(f"  con = fdb.connect(host='{FIREBIRD_HOST}', port={FIREBIRD_PORT}, database='{DB_FILE_PATH}',")
-    print(f"                    user='{FIREBIRD_USER}', password='{FIREBIRD_PASSWORD}')")
-    print("  cur = con.cursor()")
-    print("  cur.execute('SELECT * FROM employees LIMIT 5')")
-    print("  print(cur.fetchall())")
+    print("Example connection via Docker:")
+    print(f"  docker exec -it {CONTAINER_NAME} /opt/firebird/bin/isql -user {FIREBIRD_USER} -password {FIREBIRD_PASSWORD} {DB_FILE_PATH}")
+    print("\nExample queries:")
+    print("  SELECT * FROM employees WHERE department = 'Engineering';")
+    print("  SELECT COUNT(*) FROM products;")
+    print("  SELECT * FROM orders WHERE status = 'PENDING';")
     print("="*50)
     
     return True

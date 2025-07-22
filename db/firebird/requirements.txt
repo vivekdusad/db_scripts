@@ -1,1 +1,2 @@
-fdb==2.0.2 
+# No external Python libraries required
+# This script uses Docker exec to run SQL commands directly 
