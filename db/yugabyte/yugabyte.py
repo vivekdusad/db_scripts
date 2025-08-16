@@ -25,7 +25,6 @@ def run_yugabyte_container():
         "-p", "9000:9000",  # YB-Master UI
         "-p", "15433:15433",  # Web UI secure
         "-p", f"{DB_PORT}:5433",  # YSQL
-        "-p", "9042:9042",  # YCQL
         YUGABYTE_IMAGE,
         "bin/yugabyted", "start", "--background=false"
     ], check=True)
